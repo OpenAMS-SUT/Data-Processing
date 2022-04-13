@@ -1,11 +1,18 @@
 import csv
-from email.utils import getaddresses
-import numpy as np
 
 
 def decompress_time(time: int) -> tuple[int, int, int]:
-    """Extract time from word"""
-    second = (time % 30) *2
+    """Extract time from word
+    
+    Args:
+        time (int): 16 bit integer to decode into time
+
+    Returns:
+        hour (int): decoded hour
+        minute (int): decoded minute
+        second (int): decoded second
+    """
+    second = (time % 30) * 2
     minute = (time // 30) % 60
     hour = time // 1800
     # print(f"{hour}:{min}:{sec}")
@@ -13,16 +20,24 @@ def decompress_time(time: int) -> tuple[int, int, int]:
 
 
 def decompress_date(date: int) -> tuple[int, int, int]:
-    """Extract date from word"""
+    """Extract date from word
+    
+    Args:
+        date (int): 16 bit integer to decode into date
+
+    Returns:
+        hour (int): decoded day
+        month (int): decoded month
+        year (int): decoded year
+    """
     day = date & 0x001F
     month = (date >> 5) & 0x000F
     year = (date >> 9) & 0x007F
-    # print(f'{day}/{month}/{year+2000}')
-    return day, month, year
+    return day, month, year + 2000
 
 
 def parse_bytes(byte: bytes) -> int:
-    """Parse 2's complement word encoded in little endian into int"""
+    """Parse 2's complement bytes encoded in little endian into int"""
     return int.from_bytes(byte, byteorder='little', signed=True)
 
 
@@ -54,19 +69,45 @@ CONTAINERS = [7, 9, 14]
 
 # Specific frequencies in the buffer [Hz]
 FREQUENCIES = (
-    0.8, 1, 1.25, 1.6, 2, 2.5, 3.15, 4, 5, 6.3,
-    8, 10, 12.5, 16, 20, 25, 31.5, 40, 50, 63,
-    80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
-    800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300,
-    8000, 10000, 12500, 16000, 20000
+    "0.8Hz", "1Hz", "1.25Hz", "1.6Hz", "2Hz", "2.5Hz", "3.15Hz", "4Hz", "5Hz", "6.3Hz",
+    "8Hz", "10Hz", "12.5Hz", "16Hz", "20Hz", "25Hz", "31.5Hz", "40Hz", "50Hz", "63Hz",
+    "80Hz", "100Hz", "125Hz", "160Hz", "200Hz", "250Hz", "315Hz", "400Hz", "500Hz", "630Hz",
+    "800Hz", "1000Hz", "1250Hz", "1600Hz", "2000Hz", "2500Hz", "3150Hz", "4000Hz", "5000Hz", "6300Hz",
+    "8000Hz", "10000Hz", "12500Hz", "16000Hz", "20000Hz"
 )
 # FREQUENCIES[18:-6] -> 50Hz : 5000Hz
 # FREQUENCIES[18:39] -> 50Hz : 5000Hz
 
 
-class svn_buffer_parser():
+class svn_parser():
+    """Class for parsing main and buffer svn files
+
+    Example:
+        >>> r = svn_parser()
+        >>> r.load('PBL_Badania_v1/@PBL10.svn')
+        True
+        >>> r.time
+        (17, 22, 0)
+        >>> r.get_data(0)[:5]
+        [88.52, 84.97, 99.19, 97.88, 99.5]
+
+    Note:
+        Class atttributes become available after loading appropriate file.
+
+    Attributes:
+        file (str): name of the loaded file
+        associated_file (str): name of the file associated with the loaded one
+        date (tuple): measurement date 
+        time (tuple): measurement time
+        data (list): entire data from main file, used for acoustic level calculations
+        sampled_data (list): entire buffer data, used in reverberation time calculations
+    """
+
     def __init__(self) -> None:
         self.data = None
+        self.sampled_data = None
+        self.leq = None
+
         self.channels = 3
         self.samples = 160
         self.frequencies = len(FREQUENCIES)
@@ -74,18 +115,19 @@ class svn_buffer_parser():
         self.step = 100 # ms
         
         self.file = ''
-        self.buffer_file = ''
+        self.associated_file = ''
+        self.date = None
+        self.time = None
 
 
     def load(self, path: str) -> bool:
         """Load and parse main file or buffer file.
 
-        Parameters:\n
-        path -- file to open
+        Args:
+            path (str): file to open
 
         Returns:
-        True -- read was succesfull
-        False -- read was not succesfull
+            bool: True if the load was success, False otherwise.
         """
 
         file = open(path, 'rb')
@@ -97,6 +139,7 @@ class svn_buffer_parser():
             header = int.from_bytes(file.read(1), byteorder='little')
             length = int.from_bytes(file.read(1), byteorder='little')
             
+            # If the header only specifies more headers inside it, skip it
             if header in CONTAINERS:
                 file.read(2)
                 continue
@@ -109,6 +152,13 @@ class svn_buffer_parser():
             # Every header here needs to end with continue
 
             # File header
+            if header == 0x01:
+                self.file = file.read(8).decode("utf-8")
+                file.read(2)
+                self.date = decompress_date(parse_bytes(file.read(2)))
+                self.time = decompress_time(parse_bytes(file.read(2)))
+                self.associated_file = file.read(8).decode('utf-8')
+                continue
 
             # Buffer header
             if header == 0x18:
@@ -137,23 +187,63 @@ class svn_buffer_parser():
                 self.read_main_contents(file)
                 break
         
+        # Last word is always FFFFh
         if file.read(2) == b'\xff\xff':
             return True
         return False
 
 
+    def read_main_contents(self, file):
+        """Read measurement results from main file
+
+        Note:
+            Don't use this function outside.
+        """
+
+        # data: value for each individual frequency and total
+        self.data = [ [] for _ in range(self.channels) ]
+
+        for channel in range(self.channels * 2):
+            # Tercets and peak values
+            # Header
+            header = int.from_bytes(file.read(1), byteorder='little')
+
+            # Length and first word can be skipped
+            file.read(3)
+
+            # Second word is number of tercets
+            self.frequencies = parse_bytes(file.read(2))
+
+            # Third word is number of totals
+            self.totals = parse_bytes(file.read(2))
+
+            # Tercets followed by totals
+            for _ in range(self.frequencies + self.totals):
+                num = parse_bytes(file.read(2)) / 100
+
+                # Add to output array, skip peaks
+                if header == 0x10:
+                    self.data[channel // 2].append(num)
+
+
     def read_buffer_contents(self, file) -> None:
-        # Read buffer contents
+        """Read measurement results from buffer file
+
+        Note:
+            Don't use this function outside.
+        """
         self.channels = 3
         # self.samples = 160
         # self.frequencies = len(FREQUENCIES)
         self.totals = 3 # A, C, Lin
 
         # Preallocate arrays for buffer contents
-        self.data = [[[0 for _ in range(self.samples)] 
+        # sampled_data: individual frequencies and totals
+        self.sampled_data = [[[0 for _ in range(self.samples)] 
             for _ in range(self.frequencies + self.totals)] 
             for _ in range(self.channels)]
 
+        # equivalent sound level
         self.leq = [[0 for _ in range(self.samples)] 
             for _ in range(self.channels)]
 
@@ -177,71 +267,70 @@ class svn_buffer_parser():
                     num = parse_bytes(file.read(2)) / 10
                     
                     # Add to output array
-                    self.data[channel][value][sample] = num
-
-
-    def read_main_contents(self, file):
-        self.data = [ [] for _ in range(self.channels) ]
-
-        for channel in range(self.channels * 2):
-            # Tercets and peak values
-            # Header
-            header = int.from_bytes(file.read(1), byteorder='little')
-
-            # Length and first word can be skipped
-            file.read(3)
-
-            # Second word is number of tercets
-            self.frequencies = parse_bytes(file.read(2))
-
-            # Third word is number of totals
-            self.totals = parse_bytes(file.read(2))
-
-            # Tercets followed by totals
-            for value in range(self.frequencies + self.totals):
-                num = parse_bytes(file.read(2)) / 100
-
-                # Add to output array, skip peaks
-                if header == 0x10:
-                    self.data[channel // 2].append(num)
+                    self.sampled_data[channel][value][sample] = num
 
 
     def get_data(self, channel):
-        """Returns list with data containing frequencies from 50Hz to 5kHz and totals.
+        """Returns list with data containing frequencies from 50Hz to 5kHz and totals (A, C, Lin)
+
+        Args:
+            channel (int): returns data from this channel, starts from 0
+
+        Returns:
+            list: copy of frequencies and totals
         """
-        return (self.data[channel][18:39][:] + self.data[channel][-3:][:]).copy()
+        return (self.data[channel][18:39] + self.data[channel][-3:]).copy()
+
+
+    def get_sampled_data(self, channel):
+        """Returns list with data samples for frequencies from 50Hz to 5kHz and totals (A, C, Lin)
+
+        Args:
+            channel (int): returns data from this channel, starts from 0
+
+        Returns:
+            list: copy of frequencies and totals
+        """
+        return (self.sampled_data[channel][18:39][:] + self.sampled_data[channel][-3:][:]).copy()
 
 
     def export_csv(self, path: str = 'output') -> None:
-        """Export data to csv files in specified directory.
+        """Export data to csv files in specified directory
 
-        Parameters:\n
-        path -- directory for exported files (default 'output')
+        Note:
+            Output folder needs to be created beforehand
+
+        Args:
+            path (str): directory for exported files (default 'output')
         """
 
+        description = FREQUENCIES[18:39] + ('Tot A', 'Tot C', 'Tot Lin')
+        dlen = len(description)
+
         for i in range(self.channels):
-            with open(f'{path}/main{i}.csv', 'w', newline='') as out_file:
-                csv_writer = csv.writer(out_file)
-                csv_writer.writerows(self.data[i, 0:1, :])
+            if self.data != None:
+                with open(f'{path}/main{i}.csv', 'w', newline='') as out_file:
+                    csv_writer = csv.writer(out_file)
+                    # csv_writer.writerow(self.get_data(i))
+                    # Transposition
+                    for n, d in enumerate(description):
+                        csv_writer.writerow([d] + [self.get_data(i)[n]])
 
-            with open(f'{path}/tercets{i}.csv', 'w', newline='') as out_file:
-                csv_writer = csv.writer(out_file)
-                csv_writer.writerows(self.data[i, 1:-self.totals, :])
-
-            with open(f'{path}/totals{i}.csv', 'w', newline='') as out_file:
-                csv_writer = csv.writer(out_file)
-                csv_writer.writerows(self.data[i, -self.totals:, :])
+            if self.sampled_data != None:
+                with open(f'{path}/buffer{i}.csv', 'w', newline='') as out_file:
+                    csv_writer = csv.writer(out_file)
+                    # csv_writer.writerows(self.get_sampled_data(i))
+                    # Transposition
+                    for n, d in enumerate(description):
+                        csv_writer.writerow([d] + self.get_sampled_data(i)[n])
 
 
 def main():
-    reader = svn_buffer_parser()
-    print('Loading Buffer file')
-    reader.load('PBL_Badania_v1/Buffe_11.svn')
-    print(reader.get_data(0)[1:3:1][1])
-    # reader.export_csv('out')
-    print('Loading Main file')
+    reader = svn_parser()
     reader.load('PBL_Badania_v1/@PBL10.svn')
-    print(reader.get_data(0)[-4])
+    print(reader.time)
+    print(reader.get_data(0)[:5])
+    reader.export_csv()
 
 
 if __name__ == '__main__':
