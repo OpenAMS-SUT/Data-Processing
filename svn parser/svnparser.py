@@ -153,11 +153,11 @@ class svn_parser():
 
             # File header
             if header == 0x01:
-                self.file = file.read(8).decode("utf-8")
+                self.file = file.read(8).decode("utf-16")
                 file.read(2)
                 self.date = decompress_date(parse_bytes(file.read(2)))
                 self.time = decompress_time(parse_bytes(file.read(2)))
-                self.associated_file = file.read(8).decode('utf-8')
+                self.associated_file = file.read(8).decode('utf-16')
                 continue
 
             # Buffer header
